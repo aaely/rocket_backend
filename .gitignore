@@ -1,0 +1,28 @@
+# Ignore the target directory
+/target/
+
+# Ignore the Cargo lock file (for libraries)
+Cargo.lock
+
+# Ignore the .env file (if you have one)
+.env
+
+# Ignore build artifacts and other unnecessary files
+**/*.rs.bk
+**/*.rs~ 
+**/*.rs.orig
+**/*.rs.rej
+
+# By default, ignore all backup files
+*~
+
+# Ignore the node_modules directory (if you're using Node.js in some part of the project)
+/node_modules/
+
+# Ignore MacOS system files
+.DS_Store
+
+# Ignore temporary files created by editors/IDEs
+.vscode/
+.idea/
+*.swp/target/
