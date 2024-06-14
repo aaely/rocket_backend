@@ -9,9 +9,10 @@ use neo4rs::{Graph, query, Node, ConfigBuilder};
 use tokio::sync::Mutex;
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use auth::AuthenticatedUser;
+use auth::{decode_token, AuthenticatedUser, Claims};
 use role::Role;
 use bcrypt::{hash, verify, DEFAULT_COST};
+use chrono::{Utc, Duration};
 
 #[derive(Deserialize)]
 struct LoginRequest {
@@ -23,6 +24,7 @@ struct LoginRequest {
 struct LoginResponse {
     token: String,
     user: UserResponse,
+    refresh_token: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -43,6 +45,11 @@ struct Trailer {
     TrailerID: String,
     Schedule: Schedule,
     CiscoIDs: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -102,9 +109,28 @@ async fn login(login_request: Json<LoginRequest>, state: &State<AppState>) -> Re
         };
 
         if is_password_valid {
-            let token = match encode(
+            let access_expiration = Utc::now()
+                .checked_add_signed(Duration::seconds(3600))
+                .expect("valid timestamp")
+                .timestamp() as usize;
+
+            let refresh_expiration = Utc::now()
+                .checked_add_signed(Duration::days(30))
+                .expect("valid timestamp")
+                .timestamp() as usize;
+
+            let access_token = match encode(
                 &Header::default(),
-                &UserResponse { username: username.clone(), role: role.clone() },
+                &Claims { username: username.clone(), role: role.clone(), exp: access_expiration },
+                &EncodingKey::from_secret(state.jwt_secret.as_ref()),
+            ) {
+                Ok(t) => t,
+                Err(e) => return Err(Json(e.to_string())),
+            };
+
+            let refresh_token = match encode(
+                &Header::default(),
+                &Claims { username: username.clone(), role: role.clone(), exp: refresh_expiration },
                 &EncodingKey::from_secret(state.jwt_secret.as_ref()),
             ) {
                 Ok(t) => t,
@@ -112,13 +138,13 @@ async fn login(login_request: Json<LoginRequest>, state: &State<AppState>) -> Re
             };
 
             let response = LoginResponse {
-                token,
+                token: access_token,
+                refresh_token: Some(refresh_token),  // Add this field in the response
                 user: UserResponse {
                     username,
                     role,
                 },
             };
-
             return Ok(Json(response));
         } else {
             return Err(Json("Invalid password".to_string()));
@@ -152,9 +178,51 @@ async fn register(user: Json<LoginRequest>, state: &State<AppState>) -> Result<J
     }
 }
 
+#[post("/refresh", format = "json", data = "<refresh_request>")]
+async fn refresh_token(refresh_request: Json<RefreshRequest>, state: &State<AppState>) -> Result<Json<LoginResponse>, Json<String>> {
+    let claims = match decode_token(&refresh_request.refresh_token, &state.jwt_secret) {
+        Ok(claims) => claims,
+        Err(_) => return Err(Json("Invalid refresh token".to_string())),
+    };
+
+    let new_expiration = Utc::now()
+        .checked_add_signed(Duration::seconds(3600))
+        .expect("valid timestamp")
+        .timestamp() as usize;
+
+    let new_token = match encode(
+        &Header::default(),
+        &Claims {
+            username: claims.username.clone(),
+            role: claims.role.clone(),
+            exp: new_expiration,
+        },
+        &EncodingKey::from_secret(state.jwt_secret.as_ref()),
+    ) {
+        Ok(t) => t,
+        Err(e) => return Err(Json(e.to_string())),
+    };
+
+    let response = LoginResponse {
+        token: new_token,
+        refresh_token: None,  // Do not issue a new refresh token
+        user: UserResponse {
+            username: claims.username,
+            role: claims.role,
+        },
+    };
+
+    Ok(Json(response))
+}
+
 #[get("/test")]
-async fn test(state: &State<AppState>, _user: AuthenticatedUser) -> Result<Json<Vec<String>>, Json<&'static str>> {
+async fn test(state: &State<AppState>, _user: AuthenticatedUser, role: Role) -> Result<Json<Vec<String>>, Json<&'static str>> {
+    if role.0 != "read" && role.0 != "write" {
+        return Err(Json("Forbidden"));
+    }
+
     let graph = &state.graph;
+
 
     let query = query("
         USE trucks
@@ -179,7 +247,11 @@ async fn test(state: &State<AppState>, _user: AuthenticatedUser) -> Result<Json<
 }
 
 #[get("/api/schedule_trailer")]
-async fn schedule_trailer(state: &State<AppState>, _user: AuthenticatedUser) -> Result<Json<Vec<Trailer>>, Json<&'static str>> {
+async fn schedule_trailer(state: &State<AppState>, _user: AuthenticatedUser, role: Role) -> Result<Json<Vec<Trailer>>, Json<&'static str>> {
+    if role.0 != "write" {
+        return Err(Json("Forbidden"));
+    }
+    
     let graph = &state.graph;
 
     let query = query("
@@ -249,7 +321,7 @@ async fn main() {
     };
 
     rocket::build()
-        .mount("/", routes![login, test, schedule_trailer, register])
+        .mount("/", routes![refresh_token, login, test, schedule_trailer, register])
         .manage(state)
         .launch()
         .await
