@@ -26,14 +26,11 @@ impl<'r> FromRequest<'r> for AuthenticatedUser {
         let secret = "tO7E8uCjD5rXpQl0FhKwV2yMz4bJnAi9sGeR3kTzXvNmPuLsDq8W"; // Replace with your secret key
         if let Some(auth_header) = request.headers().get_one("Authorization") {
             if let Some(token) = auth_header.strip_prefix("Bearer ") {
-                println!("Received Token: {}", token);
                 match decode_token(token, secret) {
                     Ok(claims) => {
-                        println!("Decoded Claims: {:?}", claims); // Debug print
                         return Outcome::Success(AuthenticatedUser(claims));
                     },
                     Err(e) => {
-                        println!("Token decode error: {:?}", e); // Debug print
                         return Outcome::Error((Status::Unauthorized, ()));
                     },
                 }
