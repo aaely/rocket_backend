@@ -1,7 +1,7 @@
 use crate::structs::*;
-use crate::auth::{AuthenticatedUser, decode_token, Claims};
+use crate::auth::AuthenticatedUser;
 use crate::role::Role;
-use rocket::{get, post, response::status::BadRequest, routes, serde::json::Json, State};
+use rocket::{post, serde::json::Json, State};
 use neo4rs::{query, Node};
 
 #[post("/api/set_schedule", format = "json", data = "<schedule_request>")]
