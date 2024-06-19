@@ -4,19 +4,25 @@ mod auth;
 mod role;
 
 use jsonwebtoken::{encode, Header, EncodingKey};
-use rocket::{get, post, routes, serde::json::Json, State};
+use rocket::{get, post, response::status::BadRequest, routes, serde::json::Json, State};
 use neo4rs::{Graph, query, Node};
 use tokio::sync::{mpsc::UnboundedSender, Mutex};
-use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::Arc};
+use std::{collections::HashMap, fs::File, net::{IpAddr, SocketAddr}, path::Path, sync::Arc};
 use serde::{Deserialize, Serialize};
 use auth::{decode_token, AuthenticatedUser, Claims};
 use role::Role;
 use bcrypt::{hash, verify, DEFAULT_COST};
+use rocket::config::{Config};
+use rocket::figment::Figment;
+use tokio_native_tls::TlsAcceptor;
+use native_tls::{Identity, TlsAcceptor as NativeTlsAcceptor};
 use chrono::{Utc, Duration};
+use std::io::Read;
 use futures_util::{SinkExt, StreamExt};
 use rocket::tokio::net::TcpListener;
 use tokio_tungstenite::{accept_async, tungstenite::protocol::Message, WebSocketStream};
 use rocket_cors::{CorsOptions, AllowedOrigins, AllowedHeaders, Cors};
+use rocket_multipart_form_data::{MultipartFormData, MultipartFormDataOptions, MultipartFormDataField, RawField, MultipartFormDataError};
 
 type WebSocketList = Arc<Mutex<HashMap<SocketAddr, UnboundedSender<Message>>>>;
 
@@ -322,7 +328,6 @@ async fn refresh_token(refresh_request: Json<RefreshRequest>, state: &State<AppS
 
 #[get("/ws")]
 async fn ws_handler(state: &State<AppState>) -> Result<(), rocket::http::Status> {
-
     let ws_list = state.ws_list.clone();
     tokio::spawn(async move {
         if let Err(e) = run_ws_server(ws_list).await {
@@ -336,20 +341,50 @@ async fn ws_handler(state: &State<AppState>) -> Result<(), rocket::http::Status>
 async fn run_ws_server(ws_list: WebSocketList) -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("0.0.0.0:9001").await?;
 
+    // Load the SSL keys and certificates
+    let mut key_file = File::open("certs/server.key")
+        .expect("Failed to open key file");
+    let mut key = vec![];
+    key_file.read_to_end(&mut key)
+        .expect("Failed to read key file");
+
+    let mut cert_file = File::open("/usr/local/share/ca-certificates/server.crt")
+        .expect("Failed to open cert file");
+    let mut cert = vec![];
+    cert_file.read_to_end(&mut cert)
+        .expect("Failed to read cert file");
+
+    let identity = Identity::from_pkcs8(&cert, &key)?;
+    let acceptor = TlsAcceptor::from(NativeTlsAcceptor::builder(identity).build()?);
+
     while let Ok((stream, _)) = listener.accept().await {
         let peer_addr = stream.peer_addr().expect("connected streams should have a peer address");
+        let acceptor = acceptor.clone();
         let ws_list_inner = ws_list.clone();
-        tokio::spawn(handle_connection(stream, peer_addr, ws_list_inner));
+
+        tokio::spawn(async move {
+            match acceptor.accept(stream).await {
+                Ok(tls_stream) => {
+                    if let Err(e) = handle_connection(tls_stream, peer_addr, ws_list_inner).await {
+                        println!("Error in WebSocket connection: {}", e);
+                    }
+                },
+                Err(e) => println!("TLS accept error: {}", e),
+            }
+        });
     }
 
     Ok(())
 }
 
-async fn handle_connection(
-    stream: tokio::net::TcpStream,
+async fn handle_connection<S>(
+    stream: S,
     peer_addr: SocketAddr,
     ws_list: WebSocketList,
-) {
+) -> Result<(), Box<dyn std::error::Error>>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     let ws_stream = accept_async(stream).await.expect("Error during the websocket handshake occurred");
     let (mut ws_sender, mut ws_receiver) = ws_stream.split();
 
@@ -432,7 +467,16 @@ async fn handle_connection(
         let mut ws_list = ws_list_for_outgoing.lock().await;
         ws_list.remove(&peer_addr);
     });
+
+    Ok(())
 }
+
+/*
+    File Upload Routes
+*/
+
+
+
 
 /*
 Getter Routes
@@ -568,7 +612,7 @@ async fn schedule_trailer(state: &State<AppState>, _user: AuthenticatedUser, rol
                 let contact_email: String = schedule_node.get("ContactEmail").unwrap();
                 let door_number: String = schedule_node.get("DoorNumber").unwrap();
                 let is_hot: bool = schedule_node.get("IsHot").unwrap();
-                let last_free_date: String = schedule_node.get("LastFreeDate").unwrap();
+                let last_free_date: String = schedule_node.get("LastFreeDate").unwrap_or("".to_string());
                 let load_status: String = schedule_node.get("LoadStatus").unwrap();
                 let request_date: String = schedule_node.get("RequestDate").unwrap();
                 let cisco_ids: Vec<String> = record.get("CiscoIDs").unwrap();
@@ -1063,16 +1107,15 @@ impl AppState {
 async fn main() {
     let state = AppState::new().await;
 
-
+    let figment = rocket::Config::figment()
+        .merge(("tls.certs", "/usr/local/share/ca-certificates/server.crt"))
+        .merge(("tls.key", "certs/server.key"))
+        .merge(("port", 8443));
     // Configure CORS
     let cors = custom_cors();
 
     rocket::custom(
-        rocket::Config {
-            address: "192.168.4.88".parse().expect("Invalid IP address"),
-            port: 8000,
-            ..rocket::Config::default()
-        }
+        figment
     )
         .attach(cors)
         .mount("/", routes![todays_trucks, date_range_trucks, set_arrival_time, set_door, hot_trailer, set_schedule, get_load_info, trailers, ws_handler, refresh_token, login, schedule_trailer, register])
