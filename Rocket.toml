@@ -1,4 +1,4 @@
 [default]
-address = "192.168.4.88"
+address = "192.168.4.89"
 port = 8443
 tls = { certs = "/usr/local/share/ca-certificates/server.crt", key = "certs/server.key" }
